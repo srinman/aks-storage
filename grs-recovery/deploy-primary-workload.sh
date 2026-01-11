@@ -11,39 +11,71 @@ echo ""
 
 kubectl config use-context aks-primary
 
-# Step 1: Create PersistentVolume and PersistentVolumeClaim
-echo "Step 1: Creating PersistentVolume and PersistentVolumeClaim..."
+# Step 1: Create namespace
+echo "Step 1: Creating namespace..."
+kubectl create namespace blob-demo --dry-run=client -o yaml | kubectl apply -f -
+
+# Step 2: Create StorageClass
+echo ""
+echo "Step 2: Creating StorageClass with MSI authentication..."
+
+cat <<EOF | kubectl apply -f -
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: blob-fuse-grs
+provisioner: blob.csi.azure.com
+parameters:
+  skuName: Standard_GRS
+  protocol: fuse
+  resourceGroup: ${RESOURCE_GROUP}
+  storageAccount: ${STORAGE_ACCOUNT}
+  AzureStorageAuthType: MSI
+  AzureStorageIdentityClientID: "${IDENTITY_CLIENT_ID_PRIMARY}"
+reclaimPolicy: Retain
+volumeBindingMode: Immediate
+allowVolumeExpansion: true
+mountOptions:
+  - -o allow_other
+  - --file-cache-timeout-in-seconds=120
+  - --use-attr-cache=true
+  - --cancel-list-on-mount-seconds=10
+  - -o attr_timeout=120
+  - -o entry_timeout=120
+  - -o negative_timeout=120
+  - --log-level=LOG_WARNING
+  - --cache-size-mb=1000
+EOF
+
+# Step 3: Create PersistentVolume and PersistentVolumeClaim
+echo ""
+echo "Step 3: Creating PersistentVolume and PersistentVolumeClaim..."
 
 cat <<EOF | kubectl apply -f -
 apiVersion: v1
 kind: PersistentVolume
 metadata:
-  annotations:
-    pv.kubernetes.io/provisioned-by: blob.csi.azure.com
   name: pv-blob-grs
 spec:
   capacity:
-    storage: 1Pi
+    storage: 100Gi
   accessModes:
     - ReadWriteMany
   persistentVolumeReclaimPolicy: Retain
-  storageClassName: azureblob-fuse-premium
+  storageClassName: blob-fuse-grs
   mountOptions:
     - -o allow_other
     - --file-cache-timeout-in-seconds=120
-    - --use-attr-cache=true
   csi:
     driver: blob.csi.azure.com
-    readOnly: false
-    volumeHandle: ${STORAGE_ACCOUNT}_${CONTAINER_NAME}_grs
-    nodeStageSecretRef:
-      name: azure-storage-account-${STORAGE_ACCOUNT}-secret
-      namespace: blob-demo
+    volumeHandle: "${RESOURCE_GROUP}-${STORAGE_ACCOUNT}-${CONTAINER_NAME}"
     volumeAttributes:
+      protocol: fuse
       resourceGroup: ${RESOURCE_GROUP}
       storageAccount: ${STORAGE_ACCOUNT}
       containerName: ${CONTAINER_NAME}
-      protocol: fuse
+      AzureStorageAuthType: MSI
+      AzureStorageIdentityClientID: "${IDENTITY_CLIENT_ID_PRIMARY}"
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -57,111 +89,114 @@ spec:
     requests:
       storage: 10Gi
   volumeName: pv-blob-grs
-  storageClassName: azureblob-fuse-premium
+  storageClassName: blob-fuse-grs
 EOF
 
 echo "Waiting for PVC to be bound..."
 kubectl wait --for=jsonpath='{.status.phase}'=Bound pvc/pvc-blob-grs -n blob-demo --timeout=60s
 
-# Step 2: Deploy writer pod
+# Step 4: Deploy writer deployment
 echo ""
-echo "Step 2: Deploying writer pod..."
+echo "Step 4: Deploying writer deployment..."
 
 cat <<EOF | kubectl apply -f -
-apiVersion: v1
-kind: Pod
+apiVersion: apps/v1
+kind: Deployment
 metadata:
   name: blob-writer
   namespace: blob-demo
   labels:
-    azure.workload.identity/use: "true"
+    app: blob-writer
 spec:
-  serviceAccountName: blob-sa
-  nodeSelector:
-    kubernetes.io/hostname: aks-nodepool1-58701815-vmss000001
-  containers:
-  - name: netshoot
-    image: nicolaka/netshoot:latest
-    command: ["/bin/bash"]
-    args:
-      - -c
-      - |
-        echo "==================================================="
-        echo "Blob Writer Pod - Writing sample content"
-        echo "==================================================="
-        echo ""
-        echo "Current time: \$(date)"
-        echo "Hostname: \$(hostname)"
-        echo "Location: Central US (Primary)"
-        echo ""
-        
-        # Write sample data
-        echo "Writing sample content to /mnt/blob/data.txt..."
-        cat > /mnt/blob/data.txt <<DATAEOF
-        =================================================
-        GRS Storage Failover Demo
-        =================================================
-        
-        This file was created in the PRIMARY region (Central US)
-        
-        Created at: \$(date)
-        Hostname: \$(hostname)
-        Region: Central US
-        Storage Account: ${STORAGE_ACCOUNT}
-        Container: ${CONTAINER_NAME}
-        
-        Sample data:
-        - Line 1: Hello from Central US!
-        - Line 2: This is a GRS storage demo
-        - Line 3: Testing geo-redundant storage
-        - Line 4: Random value: \$(od -An -N4 -tu4 < /dev/urandom | tr -d ' ')
-        
-        This content will be replicated to East US 2 via GRS.
-        After failover, it should be readable from the secondary region.
-        =================================================
-        DATAEOF
-        
-        echo "Content written successfully!"
-        echo ""
-        echo "File contents:"
-        cat /mnt/blob/data.txt
-        echo ""
-        
-        # Create additional test files
-        echo "Creating additional test files..."
-        echo "Test file 1 created at \$(date)" > /mnt/blob/test1.txt
-        echo "Test file 2 created at \$(date)" > /mnt/blob/test2.txt
-        
-        # List all files
-        echo "Files in blob storage:"
-        ls -lah /mnt/blob/
-        echo ""
-        
-        echo "==================================================="
-        echo "Writer pod completed. Keeping pod alive..."
-        echo "==================================================="
-        
-        # Keep container running
-        tail -f /dev/null
-    volumeMounts:
-    - name: blob-storage
-      mountPath: /mnt/blob
-      readOnly: false
-  volumes:
-  - name: blob-storage
-    persistentVolumeClaim:
-      claimName: pvc-blob-grs
-  restartPolicy: Never
+  replicas: 1
+  selector:
+    matchLabels:
+      app: blob-writer
+  template:
+    metadata:
+      labels:
+        app: blob-writer
+      name: blob-writer
+    spec:
+      nodeSelector:
+        "kubernetes.io/os": linux
+      containers:
+        - name: writer
+          image: mcr.microsoft.com/mirror/docker/library/nginx:1.23
+          command:
+            - "/bin/sh"
+            - "-c"
+            - |
+              echo "==================================================="
+              echo "Blob Writer Pod - Writing sample content"
+              echo "==================================================="
+              echo ""
+              echo "Current time: \$(date)"
+              echo "Hostname: \$(hostname)"
+              echo "Location: Central US (Primary)"
+              echo ""
+              
+              # Write main data file
+              cat > /mnt/blob/data.txt <<DATAEOF
+              =================================================
+              GRS Storage Failover Demo
+              =================================================
+              
+              This file was created in the PRIMARY region (Central US)
+              
+              Created at: \$(date)
+              Hostname: \$(hostname)
+              Region: Central US
+              Storage Account: ${STORAGE_ACCOUNT}
+              Container: ${CONTAINER_NAME}
+              
+              Sample data:
+              - Line 1: Hello from Central US!
+              - Line 2: This is a GRS storage demo
+              - Line 3: Testing geo-redundant storage
+              - Line 4: Random value: \$(od -An -N4 -tu4 < /dev/urandom | tr -d ' ')
+              
+              This content will be replicated to East US 2 via GRS.
+              After failover, it should be readable from the secondary region.
+              =================================================
+              DATAEOF
+              
+              echo "Content written successfully!"
+              echo ""
+              echo "File contents:"
+              cat /mnt/blob/data.txt
+              echo ""
+              
+              # Continuous writing to demonstrate live replication
+              echo "Starting continuous writes..."
+              while true; do 
+                echo "\$(date) - Write from Central US (Primary)" >> /mnt/blob/outfile
+                sleep 1
+              done
+          volumeMounts:
+            - name: blob
+              mountPath: "/mnt/blob"
+              readOnly: false
+      volumes:
+        - name: blob
+          persistentVolumeClaim:
+            claimName: pvc-blob-grs
+  strategy:
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
 EOF
 
 echo ""
-echo "Waiting for writer pod to be ready..."
-kubectl wait --for=condition=Ready pod/blob-writer -n blob-demo --timeout=120s
+echo "Waiting for writer deployment to be ready..."
+kubectl wait --for=condition=Available deployment/blob-writer -n blob-demo --timeout=120s
+
+# Save deployment time for failover timing
+date +%s > /tmp/grs-demo-deployment-time
 
 echo ""
-echo "Checking writer pod logs..."
-sleep 5
-kubectl logs -n blob-demo blob-writer --tail=50
+echo "Checking deployment status..."
+kubectl get deployment,pod -n blob-demo
 
 echo ""
 echo "=================================================="
@@ -170,10 +205,13 @@ echo "=================================================="
 echo ""
 echo "To view logs:"
 echo "  kubectl config use-context aks-primary"
-echo "  kubectl logs -n blob-demo blob-writer -f"
+echo "  kubectl logs -n blob-demo deployment/blob-writer -f"
 echo ""
 echo "To verify data in storage:"
-echo "  kubectl exec -it -n blob-demo blob-writer -- cat /mnt/blob/data.txt"
+echo "  kubectl exec -it -n blob-demo deployment/blob-writer -- cat /mnt/blob/data.txt"
 echo ""
-echo "Next: Wait for GRS replication, then run initiate-failover.sh"
+echo "Next steps:"
+echo "  1. Wait for GRS replication (15 minutes recommended)"
+echo "  2. Run: ./initiate-failover.sh"
+echo "  3. Run: ./deploy-secondary-workload.sh"
 echo ""

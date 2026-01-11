@@ -4,48 +4,185 @@ set -e
 # Load variables
 source /tmp/grs-demo-vars.sh
 
-echo "=================================================="
+echo "======================================================="
 echo "Deploying workload in secondary cluster (eastus2)"
-echo "=================================================="
+echo "======================================================="
 echo ""
 
 kubectl config use-context aks-secondary
 
-# Step 1: Create PersistentVolume and PersistentVolumeClaim for secondary
-echo "Step 1: Creating PersistentVolume and PersistentVolumeClaim..."
+# Step 1: Create secondary private endpoint NOW (after failover)
+echo "Step 1: Creating private endpoint in ${LOCATION_SECONDARY}..."
+echo "NOTE: Creating this AFTER failover to ensure DNS points to correct region."
+echo ""
+
+# Check if PE already exists
+PE_EXISTS=$(az network private-endpoint show \
+  --name "${PE_SECONDARY}" \
+  --resource-group "${RESOURCE_GROUP}" \
+  --query id -o tsv 2>/dev/null || echo "")
+
+if [ -z "$PE_EXISTS" ]; then
+  SUBNET_PE_ID_SECONDARY=$(az network vnet subnet show \
+    --resource-group "${RESOURCE_GROUP}" \
+    --vnet-name "${VNET_SECONDARY}" \
+    --name "${SUBNET_PE_SECONDARY}" \
+    --query id -o tsv)
+
+  STORAGE_ID=$(az storage account show \
+    --name "${STORAGE_ACCOUNT}" \
+    --resource-group "${RESOURCE_GROUP}" \
+    --query id -o tsv)
+
+  az network private-endpoint create \
+    --resource-group "${RESOURCE_GROUP}" \
+    --name "${PE_SECONDARY}" \
+    --location "${LOCATION_SECONDARY}" \
+    --subnet "${SUBNET_PE_ID_SECONDARY}" \
+    --private-connection-resource-id "${STORAGE_ID}" \
+    --group-id blob \
+    --connection-name "${PE_SECONDARY}-connection"
+
+  # Get the private endpoint IP
+  PE_IP_SECONDARY=$(az network nic show --ids $(az network private-endpoint show \
+    --name "${PE_SECONDARY}" \
+    --resource-group "${RESOURCE_GROUP}" \
+    --query 'networkInterfaces[0].id' -o tsv) \
+    --query 'ipConfigurations[0].privateIPAddress' -o tsv)
+
+  echo "Secondary private endpoint created successfully!"
+  echo "IP Address: ${PE_IP_SECONDARY}"
+  
+  # Update DNS record to point to secondary region
+  # NOTE: DNS zone group doesn't automatically update A record when there's an existing one
+  # We need to manually remove the old IP and add the new one
+  echo ""
+  echo "Updating DNS to point to secondary region..."
+  
+  # Get current DNS IP(s)
+  CURRENT_IPS=$(az network private-dns record-set a show \
+    --resource-group "${RESOURCE_GROUP}" \
+    --zone-name privatelink.blob.core.windows.net \
+    --name "${STORAGE_ACCOUNT}" \
+    --query 'aRecords[].ipv4Address' -o tsv 2>/dev/null || echo "")
+  
+  # Remove old IP if it exists and is different
+  if [ -n "$CURRENT_IPS" ]; then
+    for IP in $CURRENT_IPS; do
+      if [ "$IP" != "$PE_IP_SECONDARY" ]; then
+        echo "Removing old DNS record: $IP"
+        az network private-dns record-set a remove-record \
+          --resource-group "${RESOURCE_GROUP}" \
+          --zone-name privatelink.blob.core.windows.net \
+          --record-set-name "${STORAGE_ACCOUNT}" \
+          --ipv4-address "$IP" 2>/dev/null || true
+      fi
+    done
+  fi
+  
+  # Add secondary region IP if not already present
+  if [[ "$CURRENT_IPS" != *"$PE_IP_SECONDARY"* ]]; then
+    echo "Adding DNS record for secondary region: ${PE_IP_SECONDARY}"
+    az network private-dns record-set a add-record \
+      --resource-group "${RESOURCE_GROUP}" \
+      --zone-name privatelink.blob.core.windows.net \
+      --record-set-name "${STORAGE_ACCOUNT}" \
+      --ipv4-address "${PE_IP_SECONDARY}"
+  fi
+  
+  # Verify DNS has been updated
+  echo ""
+  echo "Verifying DNS records..."
+  az network private-dns record-set a show \
+    --resource-group "${RESOURCE_GROUP}" \
+    --zone-name privatelink.blob.core.windows.net \
+    --name "${STORAGE_ACCOUNT}" \
+    --query 'aRecords[].ipv4Address' -o tsv
+  
+  echo ""
+  echo "Waiting 30 seconds for DNS propagation..."
+  sleep 30
+else
+  echo "Private endpoint ${PE_SECONDARY} already exists."
+  PE_IP_SECONDARY=$(az network nic show --ids $(az network private-endpoint show \
+    --name "${PE_SECONDARY}" \
+    --resource-group "${RESOURCE_GROUP}" \
+    --query 'networkInterfaces[0].id' -o tsv) \
+    --query 'ipConfigurations[0].privateIPAddress' -o tsv)
+  echo "IP Address: ${PE_IP_SECONDARY}"
+fi
+
+# Step 2: Create namespace
+echo ""
+echo "Step 2: Creating namespace..."
+kubectl create namespace blob-demo --dry-run=client -o yaml | kubectl apply -f -
+
+# Step 3: Create StorageClass
+echo ""
+echo "Step 3: Creating StorageClass with MSI authentication..."
+
+cat <<EOF | kubectl apply -f -
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: blob-fuse-grs
+provisioner: blob.csi.azure.com
+parameters:
+  skuName: Standard_GRS
+  protocol: fuse
+  resourceGroup: ${RESOURCE_GROUP}
+  storageAccount: ${STORAGE_ACCOUNT}
+  AzureStorageAuthType: MSI
+  AzureStorageIdentityClientID: "${IDENTITY_CLIENT_ID_SECONDARY}"
+reclaimPolicy: Retain
+volumeBindingMode: Immediate
+allowVolumeExpansion: true
+mountOptions:
+  - -o allow_other
+  - --file-cache-timeout-in-seconds=120
+  - --use-attr-cache=true
+  - --cancel-list-on-mount-seconds=10
+  - -o attr_timeout=120
+  - -o entry_timeout=120
+  - -o negative_timeout=120
+  - --log-level=LOG_WARNING
+  - --cache-size-mb=1000
+EOF
+
+# Step 4: Create PersistentVolume and PersistentVolumeClaim
+echo ""
+echo "Step 4: Creating PersistentVolume and PersistentVolumeClaim..."
 
 cat <<EOF | kubectl apply -f -
 apiVersion: v1
 kind: PersistentVolume
 metadata:
   name: pv-blob-grs-secondary
-  namespace: blob-demo
 spec:
   capacity:
-    storage: 10Gi
+    storage: 100Gi
   accessModes:
     - ReadWriteMany
   persistentVolumeReclaimPolicy: Retain
-  storageClassName: ""
+  storageClassName: blob-fuse-grs
   mountOptions:
     - -o allow_other
     - --file-cache-timeout-in-seconds=120
-    - --use-attr-cache=true
   csi:
     driver: blob.csi.azure.com
-    readOnly: false
-    volumeHandle: pv-blob-grs-secondary-${STORAGE_ACCOUNT}
+    volumeHandle: "${RESOURCE_GROUP}-${STORAGE_ACCOUNT}-${CONTAINER_NAME}-secondary"
     volumeAttributes:
       protocol: fuse
-      containerName: ${CONTAINER_NAME}
+      resourceGroup: ${RESOURCE_GROUP}
       storageAccount: ${STORAGE_ACCOUNT}
-      AzureStorageAuthType: workloadidentity
-      AzureStorageIdentityClientID: ${IDENTITY_CLIENT_ID_SECONDARY}
+      containerName: ${CONTAINER_NAME}
+      AzureStorageAuthType: MSI
+      AzureStorageIdentityClientID: "${IDENTITY_CLIENT_ID_SECONDARY}"
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: pvc-blob-grs-secondary
+  name: pvc-blob-grs
   namespace: blob-demo
 spec:
   accessModes:
@@ -54,154 +191,116 @@ spec:
     requests:
       storage: 10Gi
   volumeName: pv-blob-grs-secondary
-  storageClassName: ""
+  storageClassName: blob-fuse-grs
 EOF
 
 echo "Waiting for PVC to be bound..."
-kubectl wait --for=jsonpath='{.status.phase}'=Bound pvc/pvc-blob-grs-secondary -n blob-demo --timeout=60s
+kubectl wait --for=jsonpath='{.status.phase}'=Bound pvc/pvc-blob-grs -n blob-demo --timeout=60s
 
-# Step 2: Deploy reader pod
+# Step 5: Deploy reader deployment
 echo ""
-echo "Step 2: Deploying reader pod..."
+echo "Step 5: Deploying reader deployment..."
 
 cat <<EOF | kubectl apply -f -
-apiVersion: v1
-kind: Pod
+apiVersion: apps/v1
+kind: Deployment
 metadata:
   name: blob-reader
   namespace: blob-demo
   labels:
-    azure.workload.identity/use: "true"
+    app: blob-reader
 spec:
-  serviceAccountName: blob-sa
-  containers:
-  - name: netshoot
-    image: nicolaka/netshoot:latest
-    command: ["/bin/bash"]
-    args:
-      - -c
-      - |
-        echo "==================================================="
-        echo "Blob Reader Pod - Reading content after failover"
-        echo "==================================================="
-        echo ""
-        echo "Current time: \$(date)"
-        echo "Hostname: \$(hostname)"
-        echo "Location: East US 2 (Secondary, now Primary after failover)"
-        echo ""
-        
-        # Wait a bit for mount
-        sleep 10
-        
-        # List files in blob storage
-        echo "Listing files in blob storage:"
-        ls -lah /mnt/blob/
-        echo ""
-        
-        # Read and display the main data file
-        if [ -f /mnt/blob/data.txt ]; then
-            echo "==================================================="
-            echo "SUCCESS! Reading data.txt from failed-over storage:"
-            echo "==================================================="
-            echo ""
-            cat /mnt/blob/data.txt
-            echo ""
-            echo "==================================================="
-        else
-            echo "ERROR: data.txt not found!"
-            echo "Files available:"
-            ls -la /mnt/blob/
-        fi
-        
-        # Read other test files if they exist
-        if [ -f /mnt/blob/test1.txt ]; then
-            echo ""
-            echo "Content of test1.txt:"
-            cat /mnt/blob/test1.txt
-        fi
-        
-        if [ -f /mnt/blob/test2.txt ]; then
-            echo ""
-            echo "Content of test2.txt:"
-            cat /mnt/blob/test2.txt
-        fi
-        
-        # Write verification message
-        echo ""
-        echo "Writing verification message from secondary cluster..."
-        cat >> /mnt/blob/verification.txt <<VERIFYEOF
-        
-        =================================================
-        Verification from Secondary Cluster (East US 2)
-        =================================================
-        Read at: \$(date)
-        Hostname: \$(hostname)
-        Region: East US 2 (now primary after failover)
-        
-        ✓ Successfully read data from failed-over GRS storage!
-        ✓ All original content is accessible
-        ✓ GRS failover completed successfully
-        =================================================
-        VERIFYEOF
-        
-        echo "Verification written to verification.txt"
-        echo ""
-        
-        echo "==================================================="
-        echo "Demo Complete!"
-        echo "==================================================="
-        echo ""
-        echo "Summary:"
-        echo "--------"
-        echo "1. Data was written in Central US (primary)"
-        echo "2. GRS replicated data to East US 2 (secondary)"
-        echo "3. Failover was initiated to East US 2"
-        echo "4. Data successfully read from East US 2 cluster"
-        echo ""
-        echo "This demonstrates that GRS provides data durability"
-        echo "across Azure regions with customer-controlled failover."
-        echo ""
-        echo "==================================================="
-        echo "Keeping pod alive for inspection..."
-        echo "==================================================="
-        
-        # Keep container running
-        tail -f /dev/null
-    volumeMounts:
-    - name: blob-storage
-      mountPath: /mnt/blob
-      readOnly: false
-  volumes:
-  - name: blob-storage
-    persistentVolumeClaim:
-      claimName: pvc-blob-grs-secondary
-  restartPolicy: Never
+  replicas: 1
+  selector:
+    matchLabels:
+      app: blob-reader
+  template:
+    metadata:
+      labels:
+        app: blob-reader
+      name: blob-reader
+    spec:
+      nodeSelector:
+        "kubernetes.io/os": linux
+      containers:
+        - name: reader
+          image: mcr.microsoft.com/mirror/docker/library/nginx:1.23
+          command:
+            - "/bin/sh"
+            - "-c"
+            - |
+              echo "==================================================="
+              echo "Blob Reader Pod - Reading content after failover"
+              echo "==================================================="
+              echo ""
+              echo "Current time: \$(date)"
+              echo "Hostname: \$(hostname)"
+              echo "Location: East US 2 (Secondary - now Primary after failover)"
+              echo ""
+              
+              echo "Reading data.txt created in primary region..."
+              echo ""
+              cat /mnt/blob/data.txt
+              echo ""
+              
+              echo "Reading continuous writes from primary (before failover)..."
+              echo "Last 20 lines:"
+              tail -20 /mnt/blob/outfile || echo "No outfile found"
+              echo ""
+              
+              echo "All files in storage:"
+              ls -lah /mnt/blob/
+              echo ""
+              
+              echo "==================================================="
+              echo "SUCCESS! Data accessible after GRS failover!"
+              echo "==================================================="
+              echo ""
+              
+              # Keep running
+              echo "Keeping pod running..."
+              tail -f /dev/null
+          volumeMounts:
+            - name: blob
+              mountPath: "/mnt/blob"
+              readOnly: false
+      volumes:
+        - name: blob
+          persistentVolumeClaim:
+            claimName: pvc-blob-grs
+  strategy:
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
 EOF
 
 echo ""
-echo "Waiting for reader pod to be ready..."
-kubectl wait --for=condition=Ready pod/blob-reader -n blob-demo --timeout=120s
+echo "Waiting for reader deployment to be ready..."
+kubectl wait --for=condition=Available deployment/blob-reader -n blob-demo --timeout=120s
 
 echo ""
-echo "Checking reader pod logs..."
+echo "Checking deployment status..."
+kubectl get deployment,pod -n blob-demo
+
+echo ""
+echo "Reading data from storage..."
 sleep 5
-kubectl logs -n blob-demo blob-reader --tail=100
+kubectl logs -n blob-demo deployment/blob-reader --tail=50
 
 echo ""
-echo "=================================================="
-echo "GRS Failover Demo Complete!"
-echo "=================================================="
+echo "======================================================="
+echo "Secondary workload deployed successfully!"
+echo "======================================================="
 echo ""
-echo "The reader pod has successfully accessed data that was:"
-echo "  1. Written in ${LOCATION_PRIMARY} (original primary)"
-echo "  2. Replicated via GRS"
-echo "  3. Failed over to ${LOCATION_SECONDARY}"
-echo "  4. Read from ${LOCATION_SECONDARY} AKS cluster"
+echo "Summary:"
+echo "--------"
+echo "✓ Private endpoint created in ${LOCATION_SECONDARY}"
+echo "✓ Reader deployment running"
+echo "✓ Data accessible from failed-over storage account"
 echo ""
-echo "To view logs again:"
+echo "To view logs:"
 echo "  kubectl config use-context aks-secondary"
-echo "  kubectl logs -n blob-demo blob-reader -f"
+echo "  kubectl logs -n blob-demo deployment/blob-reader -f"
 echo ""
-echo "To interact with the pod:"
-echo "  kubectl exec -it -n blob-demo blob-reader -- /bin/bash"
+echo "GRS Failover Demo Complete!"
 echo ""

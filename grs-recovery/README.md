@@ -158,7 +158,7 @@ Create storage, private endpoints, managed identities, and configure VMSS identi
 This script deploys a pod in the Central US cluster that writes data to the blob storage using MSI authentication.
 
 ```bash
-./deploy-primary-workload-new.sh
+./deploy-primary-workload.sh
 ```
 
 **What this does:**
@@ -213,7 +213,7 @@ az storage account show \
 After the failover completes, deploy a reader pod in the East US 2 cluster.
 
 ```bash
-./deploy-secondary-workload-new.sh
+./deploy-secondary-workload.sh
 ```
 
 **What this does:**
