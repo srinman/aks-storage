@@ -143,17 +143,18 @@ stateDiagram-v2
     
     state NormalOps {
         [*] --> PrimaryActive
-        PrimaryActive: Primary: Central US (Read/Write)
-        PrimaryActive: Secondary: East US 2 (Replicating)
-        PrimaryActive: AKS Central US writing data
+        PrimaryActive: Central US Primary (Read/Write)
+        note right of PrimaryActive
+            Secondary: East US 2 (Replicating)
+            AKS Central US writing data
+        end note
     }
     
     NormalOps --> Failover: Initiate Customer-Controlled Failover
     
     state Failover {
         [*] --> Unavailable
-        Unavailable: Storage account unavailable
-        Unavailable: Duration: 1-2 hours
+        Unavailable: Storage unavailable (1-2 hours)
         Unavailable --> Completing
         Completing: Finalizing failover
     }
@@ -162,11 +163,13 @@ stateDiagram-v2
     
     state AfterFailover {
         [*] --> SecondaryActive
-        SecondaryActive: Primary: East US 2 (Read/Write)
-        SecondaryActive: Storage now LRS
-        SecondaryActive: Create PE in East US 2
-        SecondaryActive: Update DNS to point to East US 2 PE
-        SecondaryActive: AKS East US 2 reading data
+        SecondaryActive: East US 2 Now Primary (Read/Write)
+        note right of SecondaryActive
+            Storage now LRS
+            Create PE in East US 2
+            Update DNS to secondary PE
+            AKS East US 2 reading data
+        end note
     }
     
     AfterFailover --> [*]: Data verified successfully
