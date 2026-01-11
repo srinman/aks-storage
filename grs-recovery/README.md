@@ -34,6 +34,146 @@ This demo will:
 
 ## Architecture
 
+### High-Level Architecture Diagram
+
+```mermaid
+graph TB
+    subgraph "Central US (Primary Region)"
+        AKS1[AKS Cluster<br/>aks-centralus]
+        VMSS1[VMSS Node Pool<br/>with MSI]
+        MI1[Managed Identity<br/>id-blob-centralus]
+        PE1[Private Endpoint<br/>10.1.4.4]
+        
+        AKS1 --> VMSS1
+        VMSS1 -.MSI assigned.-> MI1
+    end
+    
+    subgraph "East US 2 (Secondary Region)"
+        AKS2[AKS Cluster<br/>aks-eastus2]
+        VMSS2[VMSS Node Pool<br/>with MSI]
+        MI2[Managed Identity<br/>id-blob-eastus2]
+        PE2[Private Endpoint<br/>10.2.4.4]
+        
+        AKS2 --> VMSS2
+        VMSS2 -.MSI assigned.-> MI2
+    end
+    
+    subgraph "Storage Layer"
+        ST[GRS Storage Account<br/>Standard_GRS]
+        CONT[Blob Container<br/>democontainer]
+        
+        ST --> CONT
+    end
+    
+    subgraph "DNS & Networking"
+        DNS[Private DNS Zone<br/>privatelink.blob.core.windows.net]
+    end
+    
+    %% Normal operations - Primary
+    VMSS1 -->|1. Pod requests mount| CSI1[Blob CSI Driver]
+    CSI1 -->|2. Uses MSI token| MI1
+    MI1 -->|3. Authenticate with<br/>Storage Blob Data Contributor| PE1
+    PE1 -->|4. Connect via PE| ST
+    
+    %% After failover - Secondary
+    VMSS2 -->|1. Pod requests mount| CSI2[Blob CSI Driver]
+    CSI2 -->|2. Uses MSI token| MI2
+    MI2 -->|3. Authenticate with<br/>Storage Blob Data Contributor| PE2
+    PE2 -->|4. Connect via PE| ST
+    
+    %% DNS
+    PE1 -.Register IP.-> DNS
+    PE2 -.Register IP.-> DNS
+    CSI1 -.Resolve FQDN.-> DNS
+    CSI2 -.Resolve FQDN.-> DNS
+    
+    %% Failover
+    ST -.GRS Replication.-> ST2[After Failover:<br/>Primary in East US 2]
+    ST2 -.-> CONT
+    
+    style ST fill:#e1f5ff
+    style ST2 fill:#ffe1e1
+    style MI1 fill:#d4edda
+    style MI2 fill:#d4edda
+    style CSI1 fill:#fff3cd
+    style CSI2 fill:#fff3cd
+    style DNS fill:#f8d7da
+```
+
+### MSI Mount Flow
+
+```mermaid
+sequenceDiagram
+    participant Pod as Pod (blob-writer)
+    participant CSI as Blob CSI Driver
+    participant VMSS as VMSS with MSI
+    participant IMDS as Azure IMDS
+    participant Storage as Storage Account
+    participant PE as Private Endpoint
+    
+    Note over Pod,PE: Storage Mount with MSI Authentication
+    
+    Pod->>CSI: Request PVC mount
+    Note over CSI: StorageClass specifies:<br/>AzureStorageAuthType: MSI<br/>AzureStorageIdentityClientID: xxx
+    
+    CSI->>VMSS: Check MSI assignment
+    VMSS-->>CSI: MSI available
+    
+    CSI->>IMDS: Request token for storage
+    Note over IMDS: Pod on VMSS node<br/>can access IMDS endpoint
+    IMDS-->>CSI: OAuth token with<br/>Storage Blob Data Contributor
+    
+    CSI->>PE: Resolve storage FQDN
+    PE-->>CSI: Private IP (10.1.4.4 or 10.2.4.4)
+    
+    CSI->>Storage: Mount with blobfuse2<br/>+ OAuth token
+    Storage-->>CSI: Mount successful
+    
+    CSI-->>Pod: Volume ready at /mnt/blob
+    
+    Pod->>Storage: Read/Write operations
+    Storage-->>Pod: Success
+```
+
+### GRS Failover Process
+
+```mermaid
+stateDiagram-v2
+    [*] --> NormalOps: Initial Setup
+    
+    state NormalOps {
+        [*] --> PrimaryActive
+        PrimaryActive: Primary: Central US (Read/Write)
+        PrimaryActive: Secondary: East US 2 (Replicating)
+        PrimaryActive: AKS Central US writing data
+    }
+    
+    NormalOps --> Failover: Initiate Customer-Controlled Failover
+    
+    state Failover {
+        [*] --> Unavailable
+        Unavailable: Storage account unavailable
+        Unavailable: Duration: 1-2 hours
+        Unavailable --> Completing
+        Completing: Finalizing failover
+    }
+    
+    Failover --> AfterFailover: Failover Complete
+    
+    state AfterFailover {
+        [*] --> SecondaryActive
+        SecondaryActive: Primary: East US 2 (Read/Write)
+        SecondaryActive: Storage now LRS
+        SecondaryActive: Create PE in East US 2
+        SecondaryActive: Update DNS to point to East US 2 PE
+        SecondaryActive: AKS East US 2 reading data
+    }
+    
+    AfterFailover --> [*]: Data verified successfully
+```
+
+### Detailed Network Architecture
+
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                         Azure Subscription                           │
