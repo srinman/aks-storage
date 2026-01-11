@@ -1,0 +1,22 @@
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: blob-fuse-grs
+provisioner: blob.csi.azure.com
+parameters:
+  skuName: Standard_GRS  # Changed to GRS to match your storage account
+  protocol: fuse
+  networkEndpointType: privateEndpoint
+reclaimPolicy: Retain  # Changed to Retain for GRS demo
+volumeBindingMode: Immediate
+allowVolumeExpansion: true
+mountOptions:
+  - -o allow_other
+  - --file-cache-timeout-in-seconds=120
+  - --use-attr-cache=true
+  - --cancel-list-on-mount-seconds=10  # prevent billing charges on mounting
+  - -o attr_timeout=120
+  - -o entry_timeout=120
+  - -o negative_timeout=120
+  - --log-level=LOG_WARNING  # LOG_WARNING, LOG_INFO, LOG_DEBUG
+  - --cache-size-mb=1000  # Default will be 80% of available memory, eviction will happen beyond specified value.

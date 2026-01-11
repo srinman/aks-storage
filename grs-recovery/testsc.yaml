@@ -1,0 +1,25 @@
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: blob-fuse
+provisioner: blob.csi.azure.com
+parameters:
+  skuName: Standard_GRS 
+  protocol: fuse
+  resourceGroup: rg-aks-grsdemo   # optional, node resource group by default if it's not provided
+  storageAccount: stgrsdemo768064593 # optional, a new account will be created if it's not provided
+  AzureStorageAuthType: MSI
+  AzureStorageIdentityClientID: "6ea27132-a0da-44f7-988b-637246286a2e"
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+allowVolumeExpansion: true
+mountOptions:
+  - -o allow_other
+  - --file-cache-timeout-in-seconds=120
+  - --use-attr-cache=true
+  - --cancel-list-on-mount-seconds=10  # prevent billing charges on mounting
+  - -o attr_timeout=120
+  - -o entry_timeout=120
+  - -o negative_timeout=120
+  - --log-level=LOG_WARNING  # LOG_WARNING, LOG_INFO, LOG_DEBUG
+  - --cache-size-mb=1000  # Default will be 80% of available memory, eviction will happen beyond that.

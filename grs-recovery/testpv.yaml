@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: pv-blob-test
+spec:
+  capacity:
+    storage: 100Gi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain  # If set as "Delete" container would be removed after pvc deletion
+  storageClassName: blob-fuse
+  mountOptions:
+    - -o allow_other
+    - --file-cache-timeout-in-seconds=120
+  csi:
+    driver: blob.csi.azure.com
+    # make sure this volumeid is unique in the cluster
+    volumeHandle: "rg-aks-grsdemo-stgrsdemo768064593-democontainer4-test"
+    volumeAttributes:
+      protocol: fuse
+      resourceGroup: rg-aks-grsdemo   # optional, node resource group if it's not provided
+      storageAccount: stgrsdemo768064593
+      AzureStorageAuthType: MSI
+      AzureStorageIdentityClientID: "6ea27132-a0da-44f7-988b-637246286a2e"
+      containerName: democontainer4

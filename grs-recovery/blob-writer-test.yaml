@@ -1,0 +1,77 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: blob-test
+  namespace: blob-demo
+spec:
+  containers:
+  - name: netshoot
+    image: nicolaka/netshoot:latest
+    command: ["/bin/bash"]
+    args:
+      - -c
+      - |
+        echo "==================================================="
+        echo "Blob Writer Pod - Writing sample content"
+        echo "==================================================="
+        echo ""
+        echo "Current time: $(date)"
+        echo "Hostname: $(hostname)"
+        echo "Location: Central US (Primary)"
+        echo ""
+        
+        # Write sample data
+        echo "Writing sample content to /mnt/blob/data.txt..."
+        cat > /mnt/blob/data.txt <<DATAEOF
+        =================================================
+        GRS Storage Failover Demo
+        =================================================
+        
+        This file was created in the PRIMARY region (Central US)
+        
+        Created at: $(date)
+        Hostname: $(hostname)
+        Region: Central US
+        
+        Sample data:
+        - Line 1: Hello from Central US!
+        - Line 2: This is a GRS storage demo
+        - Line 3: Testing geo-redundant storage
+        - Line 4: Random value: $(od -An -N4 -tu4 < /dev/urandom | tr -d ' ')
+        
+        This content will be replicated to East US 2 via GRS.
+        After failover, it should be readable from the secondary region.
+        =================================================
+        DATAEOF
+        
+        echo "Content written successfully!"
+        echo ""
+        echo "File contents:"
+        cat /mnt/blob/data.txt
+        echo ""
+        
+        # Create additional test files
+        echo "Creating additional test files..."
+        echo "Test file 1 created at $(date)" > /mnt/blob/test1.txt
+        echo "Test file 2 created at $(date)" > /mnt/blob/test2.txt
+        
+        # List all files
+        echo "Files in blob storage:"
+        ls -lah /mnt/blob/
+        echo ""
+        
+        echo "==================================================="
+        echo "Writer pod completed. Keeping pod alive..."
+        echo "==================================================="
+        
+        # Keep container running
+        tail -f /dev/null
+    volumeMounts:
+      - name: blob-storage
+        mountPath: /mnt/blob
+        readOnly: false
+  volumes:
+    - name: blob-storage
+      persistentVolumeClaim:
+        claimName: pvc-blob-grs-static 
+  restartPolicy: Never

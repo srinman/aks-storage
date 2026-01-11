@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  annotations:
+    pv.kubernetes.io/provisioned-by: blob.csi.azure.com
+  name: pv-blob-grs-static
+spec:
+  capacity:
+    storage: 1Pi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: blob-fuse-grs
+  mountOptions:
+    - -o allow_other
+    - --file-cache-timeout-in-seconds=120
+    - --use-attr-cache=true
+  csi:
+    driver: blob.csi.azure.com
+    readOnly: false
+    volumeHandle: stgrsdemo768064593_democontainer2
+    nodeStageSecretRef:
+      name: azure-storage-account-stgrsdemo768064593-secret
+      namespace: blob-demo
+    volumeAttributes:
+      resourceGroup: rg-aks-grsdemo
+      storageAccount: stgrsdemo768064593
+      containerName: democontainer2
+      protocol: fuse2
+      # Private endpoint is used automatically via DNS resolution
+      # Private endpoint: pe-blob-centralus
+      # Private DNS zone: privatelink.blob.core.windows.net
